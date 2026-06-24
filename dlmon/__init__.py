@@ -1,4 +1,4 @@
-from dlmon.monitor import DLMonitor
+from dlmon.monitor import DLMonitor, GuardedLoader
 from dlmon.invariants import (
     BatchDistribution, CompletenessMode, PartitionExclusive,
     SampleUniqueness, EpochCompleteness,
@@ -13,4 +13,4 @@ from dlmon.dataset_guard import DatasetGuard, MonitoredCompose
 from dlmon.iterable_guard import IterableGuard
 from dlmon.inference import save_bounds, load_bounds
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

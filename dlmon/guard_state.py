@@ -48,6 +48,8 @@ class GuardState:
         self._batch_size: int | None = None
         self._batch_accumulator: list[int] = []
         self._batch_count: int = 0
+        self.last_batch_indices: list[int] = []
+        self._batch_reference_sig: list[dict] | None = None
 
         self.iterable_dup_threshold: float = 0.05
         self.iterable_min_samples: int = 1000
@@ -78,6 +80,8 @@ class GuardState:
         self.seen_indices.clear()
         self._batch_accumulator.clear()
         self._batch_count = 0
+        self.last_batch_indices = []
+        self._batch_reference_sig = None
 
         if self.uniqueness is not None:
             self.uniqueness.start_epoch(self.epoch)
@@ -109,20 +113,23 @@ class GuardState:
         if self.sequential_order is not None:
             self.sequential_order.record_samples([idx])
 
-        # Auto-batching batch boundary reconstruction for BatchDistribution
-        if self._batch_size is not None and self.label_cache is not None:
+        if self._batch_size is not None:
             self._batch_accumulator.append(idx)
             if len(self._batch_accumulator) >= self._batch_size:
                 self._flush_batch_accumulator()
 
     def _flush_batch_accumulator(self) -> None:
-        if self._batch_accumulator and self.label_cache is not None and self.batch_dist is not None:
-            self._batch_count += 1
+        if not self._batch_accumulator:
+            return
+        self._batch_count += 1
+        self.last_batch_indices = list(self._batch_accumulator)
+        if self.label_cache is not None and self.batch_dist is not None:
             if self._batch_size is None or len(self._batch_accumulator) == self._batch_size:
                 self._feed_batch_dist(self._batch_accumulator)
-            self._batch_accumulator = []
+        self._batch_accumulator = []
 
     def on_batch_boundary(self, indices: list[int]) -> None:
+        self.last_batch_indices = list(indices)
         if self.label_cache is not None and self.batch_dist is not None:
             self._batch_count += 1
             self._feed_batch_dist(indices)

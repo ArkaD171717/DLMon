@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 import math
-import threading
 import warnings
 from typing import Any
 
@@ -31,8 +30,137 @@ class GuardError(RuntimeError):
     pass
 
 
+class GuardedLoader:
+    """Iterable wrapper around a DataLoader for runtime monitoring.
+
+    Iterate this object instead of the raw DataLoader.
+    Forwards attribute access to the underlying loader for transparency.
+    """
+
+    COLLATE_CHECK_RATE = 10
+
+    def __init__(self, loader: DataLoader, state: GuardState):
+        self._loader = loader
+        self._state = state
+        self._batch_idx = 0
+        self._shape_mismatch_fired = False
+        self._collate_fired = False
+        self._num_workers = getattr(loader, "num_workers", 0)
+
+    def __iter__(self):
+        self._batch_idx = 0
+        for batch in self._loader:
+            self._batch_idx += 1
+            self._check_batch(batch)
+            yield batch
+
+    def __len__(self):
+        return len(self._loader)
+
+    def __getattr__(self, name: str):
+        return getattr(self._loader, name)
+
+    def _check_batch(self, batch) -> None:
+        self._check_nan_inf(batch)
+        self._check_shape_dtype(batch)
+        # Collate check requires sampler-index/batch-content synchrony,
+        # which breaks under worker prefetching
+        if self._num_workers == 0 and self._batch_idx % self.COLLATE_CHECK_RATE == 1:
+            self._check_collate_labels(batch)
+
+    def _check_nan_inf(self, batch) -> None:
+        tensors = _extract_tensors(batch)
+        for i, t in enumerate(tensors):
+            has_nan = bool(torch.isnan(t).any().item())
+            has_inf = bool(torch.isinf(t).any().item())
+            if has_nan or has_inf:
+                problems = []
+                if has_nan:
+                    problems.append("NaN")
+                if has_inf:
+                    problems.append("Inf")
+                self._state.violations.append(Violation(
+                    type=ViolationType.NAN_INF_OUTPUT,
+                    message=f"Batch {self._batch_idx} element {i} contains "
+                            f"{'+'.join(problems)}",
+                    epoch=self._state.epoch,
+                    batch_idx=self._batch_idx,
+                    details={"batch_idx": self._batch_idx, "element": i,
+                             "has_nan": has_nan, "has_inf": has_inf},
+                ))
+
+    def _check_shape_dtype(self, batch) -> None:
+        if self._shape_mismatch_fired:
+            return
+        sig = _batch_signature(batch)
+        if not sig:
+            return
+        state = self._state
+        if state._batch_reference_sig is None:
+            state._batch_reference_sig = sig
+            return
+        ref = state._batch_reference_sig
+        for i, (r, c) in enumerate(zip(ref, sig)):
+            if r["dtype"] != c["dtype"]:
+                self._shape_mismatch_fired = True
+                state.violations.append(Violation(
+                    type=ViolationType.SHAPE_MISMATCH,
+                    message=f"Batch {self._batch_idx} element {i}: dtype "
+                            f"{c['dtype']} differs from reference {r['dtype']}",
+                    epoch=state.epoch,
+                    batch_idx=self._batch_idx,
+                    details={"element": i, "expected_dtype": r["dtype"],
+                             "actual_dtype": c["dtype"]},
+                ))
+                return
+            r_tail = r["shape"][1:]
+            c_tail = c["shape"][1:]
+            if r_tail and c_tail and r_tail != c_tail:
+                self._shape_mismatch_fired = True
+                state.violations.append(Violation(
+                    type=ViolationType.SHAPE_MISMATCH,
+                    message=f"Batch {self._batch_idx} element {i}: shape "
+                            f"{c['shape']} differs from reference {r['shape']} "
+                            f"(non-batch dimensions changed)",
+                    epoch=state.epoch,
+                    batch_idx=self._batch_idx,
+                    details={"element": i, "expected_shape": list(r["shape"]),
+                             "actual_shape": list(c["shape"])},
+                ))
+                return
+
+    def _check_collate_labels(self, batch) -> None:
+        if self._collate_fired:
+            return
+        state = self._state
+        if state.label_cache is None or not state.last_batch_indices:
+            return
+        expected = []
+        for idx in state.last_batch_indices:
+            if 0 <= idx < len(state.label_cache):
+                expected.append(state.label_cache[idx])
+        if not expected:
+            return
+        actual = _extract_labels(batch)
+        if actual is None or len(actual) != len(expected):
+            return
+        if expected != actual:
+            mismatches = sum(1 for a, b in zip(expected, actual) if a != b)
+            self._collate_fired = True
+            state.violations.append(Violation(
+                type=ViolationType.COLLATE_LABEL_CORRUPTION,
+                message=f"Batch {self._batch_idx}: {mismatches}/{len(expected)} "
+                        f"labels differ from expected based on sampler indices",
+                epoch=state.epoch,
+                batch_idx=self._batch_idx,
+                details={"mismatches": mismatches,
+                         "batch_size": len(expected),
+                         "expected_labels": expected[:8],
+                         "actual_labels": actual[:8]},
+            ))
+
+
 class DLMonitor:
-    _patch_lock = threading.Lock()
 
     def __init__(
         self,
@@ -47,6 +175,7 @@ class DLMonitor:
         self._attached = False
 
         self._guarded_states: dict[int, GuardState] = {}
+        self._guarded_loader_ids: set[int] = set()
 
     def guard(
         self,
@@ -57,16 +186,18 @@ class DLMonitor:
         dataset_monitoring: bool = True,
         learned_bounds: dict | None = None,
         allow_stochastic_eval: bool = False,
-    ) -> DataLoader:
-        """Wrap a DataLoader's sampler in-place for runtime monitoring.
+    ) -> GuardedLoader:
+        """Wrap a DataLoader for runtime monitoring.
+
+        Returns a GuardedLoader iterable. Iterate the returned object
+        instead of the original DataLoader.
 
         Dataset-level checks need num_workers=0; with workers > 0 only
         sampler-level and guard-time checks are active.
         """
         self._compat_self_check()
-        if getattr(loader, "_iterator", None) is not None:
-            raise GuardError("guard() must be called before the loader is first iterated")
-        if hasattr(loader, "_dlmon_state"):
+
+        if id(loader) in self._guarded_loader_ids:
             raise GuardError("loader is already guarded")
 
         dataset = loader.dataset
@@ -82,7 +213,7 @@ class DLMonitor:
                     "Bounds ignored.",
                     stacklevel=2,
                 )
-            spec = SamplerSpec()  # conservative defaults
+            spec = SamplerSpec()
             if expect_duplicates:
                 spec.uniqueness = False
             if role != "train":
@@ -92,8 +223,7 @@ class DLMonitor:
 
             if num_workers == 0:
                 from dlmon.iterable_guard import IterableGuard
-                wrapped = IterableGuard(dataset, state)
-                object.__setattr__(loader, "dataset", wrapped)
+                object.__setattr__(loader, "dataset", IterableGuard(dataset, state))
                 state.dataset_monitoring_status = "ITERABLE_ACTIVE"
             else:
                 warnings.warn(
@@ -106,9 +236,9 @@ class DLMonitor:
 
             state.label_cache_status = "NOT_APPLICABLE"
 
-            object.__setattr__(loader, "_dlmon_state", state)
             self._guarded_states[id(loader)] = state
-            return loader
+            self._guarded_loader_ids.add(id(loader))
+            return GuardedLoader(loader, state)
 
         inner_sampler = self._get_inner_sampler(loader)
         spec = classify_sampler(inner_sampler, dataset_len)
@@ -120,14 +250,13 @@ class DLMonitor:
             spec.shuffle_expected = False
 
         state = GuardState(spec=spec, dataset_len=dataset_len, role=role)
-        state.dataset_ref = dataset  # for auto partition overlap checking
+        state.dataset_ref = dataset
 
         if self._is_auto_batching_stock(loader):
             guard = SamplerGuard(loader.batch_sampler.sampler, state)
             loader.batch_sampler.sampler = guard
-            object.__setattr__(loader, "sampler", guard)
             state._batch_size = loader.batch_sampler.batch_size
-        elif self._is_auto_collation(loader):
+        elif loader.batch_sampler is not None:
             guard = BatchSamplerGuard(loader.batch_sampler, state)
             object.__setattr__(loader, "batch_sampler", guard)
         else:
@@ -135,8 +264,6 @@ class DLMonitor:
             object.__setattr__(loader, "sampler", guard)
 
         if not dataset_monitoring:
-            # Sampler-level-only configuration: no DatasetGuard, no
-            # MonitoredCompose, no label cache, no BatchDistribution.
             state.dataset_monitoring_status = "DISABLED_BY_CONFIG"
             state.label_cache_status = "DISABLED_BY_CONFIG"
             if learned_bounds is not None:
@@ -162,10 +289,10 @@ class DLMonitor:
             else:
                 warnings.warn(
                     "DLMon: dataset-level monitoring (NaN detection, dtype "
-                    "truncation, transform no-op, label cross-check, collate guard) "
+                    "truncation, transform no-op, label cross-check) "
                     "is DISABLED because num_workers > 0. These checks require "
                     "num_workers=0. Only sampler-level invariants + guard-time "
-                    "checks (STOCVAL-01, WSEED-01) are active. "
+                    "checks are active. "
                     "Use monitor.preflight(dataset) for pre-training transform checks.",
                     stacklevel=2,
                 )
@@ -177,17 +304,17 @@ class DLMonitor:
         if num_workers > 0 and not is_iterable:
             self._check_worker_seeds(loader, dataset, state, num_workers)
 
-        if num_workers == 0 and not is_iterable:
-            self._wire_collate_guard(loader, state)
-
-        object.__setattr__(loader, "_dlmon_state", state)
         self._guarded_states[id(loader)] = state
+        self._guarded_loader_ids.add(id(loader))
 
-        return loader
+        return GuardedLoader(loader, state)
 
-    def export_bounds(self, loader: DataLoader) -> dict:
+    def export_bounds(self, loader: DataLoader | GuardedLoader) -> dict:
         """Export learned BatchDistribution bounds for later re-injection."""
-        state = self._guarded_states.get(id(loader))
+        if isinstance(loader, GuardedLoader):
+            state = self._guarded_states.get(id(loader._loader))
+        else:
+            state = self._guarded_states.get(id(loader))
         if state is None:
             raise GuardError("loader is not guarded by this monitor")
 
@@ -298,38 +425,29 @@ class DLMonitor:
         if cls._compat_checked:
             return
         try:
-            scratch_ds = [(0, 0)]
-            scratch = DataLoader(scratch_ds, batch_size=1)
-            assert hasattr(scratch, "_auto_collation"), "_auto_collation missing"
-            assert hasattr(scratch, "_iterator"), "_iterator missing"
-            assert hasattr(scratch, "_dataset_kind"), "_dataset_kind missing"
-            assert hasattr(scratch.batch_sampler, "sampler"), "BatchSampler.sampler missing"
-            object.__setattr__(scratch, "_dlmon_probe", 1)
-            assert getattr(scratch, "_dlmon_probe", None) == 1, \
-                "object.__setattr__ round-trip failed"
-        except AssertionError as e:
+            scratch = DataLoader([(0, 0)], batch_size=1)
+            _ = scratch.batch_sampler.sampler
+            scratch.batch_sampler.sampler = scratch.batch_sampler.sampler
+            # DataLoader.__setattr__ blocks post-init writes to public attrs;
+            # verify object.__setattr__ bypass works for the ones we need
+            object.__setattr__(scratch, "dataset", scratch.dataset)
+        except Exception as e:
             raise GuardError(
                 f"dlmon compatibility self-check failed on torch "
-                f"{torch.__version__}: {e}. The DataLoader internals this "
-                f"design wraps have changed; do not guard loaders on this "
-                f"version."
+                f"{torch.__version__}: {e}."
             ) from e
         cls._compat_checked = True
 
     def _get_inner_sampler(self, loader: DataLoader) -> Sampler:
         if self._is_auto_batching_stock(loader):
             return loader.batch_sampler.sampler
-        if self._is_auto_collation(loader):
+        if loader.batch_sampler is not None:
             return loader.batch_sampler
         return loader.sampler
 
     @staticmethod
     def _is_auto_batching_stock(loader: DataLoader) -> bool:
         return type(loader.batch_sampler) is BatchSampler
-
-    @staticmethod
-    def _is_auto_collation(loader: DataLoader) -> bool:
-        return getattr(loader, "_auto_collation", True)
 
     @staticmethod
     def _build_label_cache(
@@ -400,15 +518,6 @@ class DLMonitor:
                 pass
 
         return monitored_t
-
-    @staticmethod
-    def _wire_collate_guard(loader: DataLoader, state: "GuardState") -> None:
-        from torch.utils.data._utils.collate import default_collate
-        collate_fn = getattr(loader, "collate_fn", None)
-        if collate_fn is None or collate_fn is default_collate:
-            return
-        wrapped = _CollateGuard(collate_fn, state)
-        object.__setattr__(loader, "collate_fn", wrapped)
 
     @staticmethod
     def _check_worker_seeds(
@@ -488,8 +597,7 @@ class DLMonitor:
     @staticmethod
     def _check_stochastic_eval(loader: DataLoader, state: "GuardState") -> None:
         dataset = loader.dataset
-        from dlmon.dataset_guard import DatasetGuard as DG
-        inner = dataset.inner if isinstance(dataset, DG) else dataset
+        inner = dataset.inner if isinstance(dataset, DatasetGuard) else dataset
         for attr in ("transform", "target_transform"):
             fn = getattr(inner, attr, None)
             if fn is None:
@@ -506,7 +614,7 @@ class DLMonitor:
                         details={"transform": type(step).__name__,
                                  "role": state.role, "attr": attr},
                     ))
-                    return  # one violation per loader is enough
+                    return
 
     @staticmethod
     def _wrap_if_present(
@@ -658,19 +766,20 @@ class DLMonitor:
             "violations": violations,
         }
 
-    def attach(self, loader: DataLoader | None = None) -> DLMonitor:
+    def attach(self, loader: DataLoader | None = None) -> GuardedLoader:
         if loader is None:
             raise GuardError(
                 "attach() with no argument (global DataLoader patching) is removed. "
                 "Use monitor.guard(loader) for each DataLoader instead."
             )
         warnings.warn(
-            "DLMonitor.attach(loader) is deprecated. Use monitor.guard(loader) instead.",
+            "DLMonitor.attach(loader) is deprecated. "
+            "Use: guarded = monitor.guard(loader, role=...) and iterate "
+            "'guarded' instead of the raw loader.",
             DeprecationWarning,
             stacklevel=2,
         )
-        self.guard(loader)
-        return self
+        return self.guard(loader)
 
     def detach(self) -> None:
         self._attached = False
@@ -687,7 +796,6 @@ class DLMonitor:
     def check_partitions(self) -> list[Violation]:
         vs = self.partitions.check()
 
-        # Auto-check across guarded loaders sharing one dataset object.
         states = list(self._guarded_states.values())
         for i in range(len(states)):
             for j in range(i + 1, len(states)):
@@ -774,70 +882,37 @@ class DLMonitor:
 
 
 
-class _CollateGuard:
-    SAMPLE_RATE = 10
+def _extract_tensors(batch: Any) -> list[torch.Tensor]:
+    if isinstance(batch, torch.Tensor):
+        return [batch]
+    if isinstance(batch, dict):
+        return [v for v in batch.values() if isinstance(v, torch.Tensor)]
+    if isinstance(batch, (tuple, list)):
+        return [v for v in batch if isinstance(v, torch.Tensor)]
+    return []
 
-    def __init__(self, inner_collate, state: "GuardState"):
-        self.inner = inner_collate
-        self.state = state
-        self._batch_count = 0
-        self._fired = False
 
-    def __call__(self, batch):
-        self._batch_count += 1
-        result = self.inner(batch)
+def _batch_signature(batch: Any) -> list[dict]:
+    tensors = _extract_tensors(batch)
+    return [{"shape": tuple(t.shape), "dtype": str(t.dtype)} for t in tensors]
 
-        if self._fired or self._batch_count % self.SAMPLE_RATE != 1:
-            return result
 
-        if (not isinstance(batch, list) or len(batch) == 0
-                or not isinstance(batch[0], (tuple, list)) or len(batch[0]) < 2):
-            return result
-
-        try:
-            pre_labels = [int(item[1]) for item in batch]
-        except (TypeError, ValueError):
-            return result
-
-        if not isinstance(result, (tuple, list)) or len(result) < 2:
-            return result
-
-        post_labels_tensor = result[1]
-        try:
-            if isinstance(post_labels_tensor, torch.Tensor):
-                post_labels = post_labels_tensor.tolist()
-            else:
-                post_labels = [int(x) for x in post_labels_tensor]
-        except (TypeError, ValueError):
-            return result
-
-        if len(pre_labels) != len(post_labels):
-            self._fired = True
-            self.state.violations.append(Violation(
-                type=ViolationType.COLLATE_LABEL_CORRUPTION,
-                message=f"collate_fn changed batch size: {len(pre_labels)} "
-                        f"items in, {len(post_labels)} labels out",
-                epoch=self.state.epoch,
-                batch_idx=self._batch_count,
-                details={"pre_count": len(pre_labels),
-                         "post_count": len(post_labels)},
-            ))
-        elif pre_labels != post_labels:
-            self._fired = True
-            mismatches = sum(1 for a, b in zip(pre_labels, post_labels) if a != b)
-            self.state.violations.append(Violation(
-                type=ViolationType.COLLATE_LABEL_CORRUPTION,
-                message=f"collate_fn reordered/changed {mismatches}/{len(pre_labels)} "
-                        f"labels; input-label pairing is broken",
-                epoch=self.state.epoch,
-                batch_idx=self._batch_count,
-                details={"mismatches": mismatches,
-                         "batch_size": len(pre_labels),
-                         "pre_labels": pre_labels[:8],
-                         "post_labels": post_labels[:8]},
-            ))
-
-        return result
+def _extract_labels(batch: Any) -> list[int] | None:
+    if isinstance(batch, (tuple, list)) and len(batch) >= 2:
+        labels = batch[1]
+        if isinstance(labels, torch.Tensor):
+            try:
+                return labels.tolist()
+            except Exception:
+                return None
+    if isinstance(batch, dict):
+        for key in ("label", "labels", "target", "targets", "y"):
+            if key in batch and isinstance(batch[key], torch.Tensor):
+                try:
+                    return batch[key].tolist()
+                except Exception:
+                    return None
+    return None
 
 
 def _extract_transform_list(fn: Any) -> list:
@@ -887,5 +962,3 @@ def _all_identical(outputs: list) -> bool:
         if method == "UNCHECKED" or not eq:
             return False
     return True
-
-
